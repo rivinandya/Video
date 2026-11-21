@@ -98,6 +98,25 @@ class Scene:
             static = np.maximum(static, keep)
         self.static = static
         self.water = self.poly_mask(c.get("water")) * (1 - static)
+        # floating objects: move rigidly (bob / rock / drift) instead of warping
+        self.floaters = []
+        fl_total = np.zeros((self.H, self.W), np.float32)
+        for fdef in c.get("floaters", []):
+            m = np.zeros((self.H, self.W), np.float32)
+            if isinstance(fdef, dict) and "ellipse" in fdef:
+                cx, cy, rx, ry, ang = fdef["ellipse"]
+                cv2.ellipse(m, (int(cx * self.W), int(cy * self.H)),
+                            (max(1, int(rx * self.W)), max(1, int(ry * self.H))), ang, 0, 360, 1.0, -1)
+            else:
+                pts = fdef["poly"] if isinstance(fdef, dict) else fdef
+                cv2.fillPoly(m, [np.array([self.px(q) for q in pts], np.int32)], 1.0)
+            ys, xs = np.nonzero(m)
+            if not len(xs):
+                continue
+            m = blur(m, self.feather * 0.4) * (1 - static)
+            self.floaters.append((m, (float(xs.mean()), float(ys.mean()))))
+            fl_total = np.maximum(fl_total, m)
+        self.floater_mask = fl_total
         self.sway = self.poly_mask(c.get("sway"), self.feather * 2) * (1 - static)
         self.hilite = sstep(0.45, 0.85, self.lum)
 
@@ -115,6 +134,7 @@ class Scene:
         ov = self.src.copy()
         ov = ov * (1 - 0.5 * self.water[..., None]) + 0.5 * self.water[..., None] * np.array([0.9, 0.6, 0.0])
         ov = ov * (1 - 0.6 * self.static[..., None]) + 0.6 * self.static[..., None] * np.array([1.0, 0.0, 1.0])
+        ov = ov * (1 - 0.6 * self.floater_mask[..., None]) + 0.6 * self.floater_mask[..., None] * np.array([0.0, 0.85, 1.0])
         ov = ov * (1 - 0.4 * self.sway[..., None]) + 0.4 * self.sway[..., None] * np.array([0.0, 1.0, 0.0])
         dep = cv2.applyColorMap((self.depth * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
         fx, fy = self.px(self.cfg.get("focus", [0.5, 0.5]))
@@ -156,6 +176,23 @@ def render(sc, args):
 
     def advect(nz, tp):
         return remap(nz, bu % T, (bv - tp * speed / persp) % T, border=cv2.BORDER_WRAP)
+
+    # realistic water: standing waves (low/mid frequencies) only wobble, while the fine
+    # surface detail (ripples, sparkle, foam) is carried downstream with a two-phase
+    # flow map, shutter-like motion blur, and contrast-preserving crossfade.
+    detail_sigma = c.get("detail_sigma", 2.5) * W / 1672
+    base_img = cv2.GaussianBlur(sc.src, (0, 0), detail_sigma)
+    fine = sc.src - base_img
+    P = float(c.get("flow_period", 20))                  # frames per flow-map cycle
+    surf = speed * c.get("surface_speed", 0.5)           # px/frame of travelling ripples
+    mblur = c.get("motion_blur", 1.0)
+    standing = c.get("standing_wave", 0.7)               # wobble strength of the big waves
+    pn = np.clip(remap(NZ[4], (xx / 2.5) % T, (yy / 2.5) % T, border=cv2.BORDER_WRAP) * 0.3 + 0.5, 0, 1)
+    wf = (sc.water * (1 - sc.floater_mask))[..., None]
+    fl_par = [(m, cen, rng.uniform(0, 2 * np.pi, 3), rng.uniform(0.22, 0.45))
+              for m, cen in sc.floaters]
+    drift = c.get("floater_drift", 1.0)
+    bobs = c.get("floater_bob", 1.0)
 
     # ---- light rays + dust
     rays_cfg = c.get("rays")
@@ -222,21 +259,57 @@ def render(sc, args):
         if sc.water.any():
             n1, n2, n3 = advect(NZ[0], f), advect(NZ[1], f * 1.15), advect(NZ[2], f * 1.3)
             bob = advect(NZ[4], f * 0.5)
-            a = sc.water * (0.5 + 2.6 * sc.depth) * ws * W / 1672
+            a = sc.water * (0.5 + 2.6 * sc.depth) * ws * standing * W / 1672
             lat = 0.55 * n2 + 0.35 * n3 + 0.6 * bob
             dx += a * (lat * ux + 0.5 * n1 * fx)
             dy += a * (lat * uy + 0.5 * n1 * fy)
+            for m, (cx, cy), ph, fr in fl_par:  # rigid bob / rock / drift per floater
+                ix, iy = int(min(cx, W - 1)), int(min(cy, H - 1))
+                dd = float(sc.depth[iy, ix])
+                amp = (0.8 + 3.0 * dd) * ws * bobs * W / 1672
+                lx, ly = float(ux[iy, ix]), float(uy[iy, ix])
+                vx, vy = float(fx[iy, ix]), float(fy[iy, ix])
+                b1 = np.sin(2 * np.pi * fr * sec + ph[0])
+                b2 = np.sin(2 * np.pi * fr * 1.37 * sec + ph[1])
+                dr = drift * (0.4 + 2.0 * dd) * sec * W / 1672
+                tx = amp * (0.7 * b1 * lx + 0.45 * b2 * vx) + dr * vx
+                ty = amp * (0.7 * b1 * ly + 0.45 * b2 * vy) + dr * vy + 0.35 * amp * b2
+                th = 0.006 * bobs * np.sin(2 * np.pi * fr * 0.8 * sec + ph[2])
+                ct, st_ = np.cos(th), np.sin(th)
+                rx_, ry_ = xx - cx - tx, yy - cy - ty
+                sxp = ct * rx_ + st_ * ry_ + cx
+                syp = -st_ * rx_ + ct * ry_ + cy
+                dx = dx * (1 - m) + m * (sxp - xx)
+                dy = dy * (1 - m) + m * (syp - yy)
         if sc.sway.any():
             s = sc.sway * sw_amp * (1.6 * np.sin(2 * np.pi * sec / 3.1 + yy / (0.15 * H)) +
                                     0.6 * np.sin(2 * np.pi * sec / 1.3 + xx / (0.054 * W)))
             dx += s; dy += 0.4 * s
-        if sc.water.any() or sc.sway.any():
+        if sc.water.any():
+            mx_, my_ = xx + dx, yy + dy
+            frame = remap(base_img, mx_, my_, cv2.INTER_CUBIC, cv2.BORDER_REFLECT)
+            fine_w = remap(fine, mx_, my_, cv2.INTER_CUBIC, cv2.BORDER_REFLECT)
+            acc = 0.0
+            w2 = 0.0
+            for k in (0.0, 0.5):
+                ph_ = (f / P + k + pn) % 1.0
+                w = 1.0 - np.abs(2.0 * ph_ - 1.0)
+                off = (ph_ - 0.5) * P * surf
+                smp = 0.0
+                for j in (-2.0, -1.0, 0.0, 1.0, 2.0):
+                    o = off + j * 0.3 * surf * mblur
+                    smp = smp + remap(fine, mx_ - fx * o, my_ - fy * o, cv2.INTER_LINEAR, cv2.BORDER_REFLECT)
+                acc = acc + w[..., None] * smp / 5.0
+                w2 = w2 + w * w
+            fine_flow = acc / np.sqrt(w2 + 1e-4)[..., None]
+            frame = frame + fine_w * (1 - wf) + fine_flow * wf
+        elif sc.sway.any():
             frame = remap(sc.src, xx + dx, yy + dy, cv2.INTER_CUBIC, cv2.BORDER_REFLECT)
         if sc.water.any():
             g = advect(NZ[3], f * 1.6)
             glint = np.clip(g - 1.2, 0, None) ** 2 * (0.25 + sc.hilite) * sc.water * (0.3 + 0.7 * sc.depth)
             frame = frame * (1 + 0.22 * ws * n3 * sc.hilite * sc.water)[..., None] \
-                + (0.30 * glint)[..., None] * warm
+                + (c.get("glints", 0.12) * glint)[..., None] * warm
         if rays_cfg:
             r = 0.5 + 0.5 * np.sin(ang * 46 + 0.35 * sec + np.sin(ang * 13 - 0.25 * sec) * 1.4)
             r *= 0.5 + 0.5 * np.sin(ang * 19 - 0.2 * sec + 1.7)

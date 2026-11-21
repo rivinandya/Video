@@ -64,6 +64,8 @@ Requirements: `python3`, `numpy`, `opencv-python-headless` (`pip install opencv-
 | `rays` | `{"source":[x,y], "strength":0.06, "zone":[polygon] (optional)}` |
 | `dust`, `dust_box` | number of motes, and their box `[x0,y0,x1,y1]` |
 | `water_strength`, `water_speed`, `sway_strength`, `handheld`, `grain` | multipliers (1.0) / grain sigma (0.008) |
+| `floaters` | floating objects that bob, rock and drift rigidly: `{"ellipse":[cx,cy,rx,ry,deg]}` or `{"poly":[...]}` |
+| `standing_wave`, `surface_speed`, `flow_period`, `motion_blur`, `detail_sigma`, `glints`, `floater_bob`, `floater_drift` | water realism controls. **See the `realistic-water` skill** for what each does and how to tune it. |
 | `light_bgr` | colour of the glints and rays (warm by default) |
 | `feather` | mask edge softness as a fraction of the width (0.025) |
 
